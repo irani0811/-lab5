@@ -1,0 +1,25 @@
+# datasets / outputs
+/data/
+/outputs/
+/outputs_*/
+
+# model checkpoints
+*.pt
+*.pth
+
+# temp / cache
+/pptx_tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# optional (can be large)
+/captions.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
