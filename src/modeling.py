@@ -29,6 +29,8 @@ class MultiModalSentimentModel(nn.Module):
         text_train_layers: int = -1,
         cross_attn_heads: int = 4,
         modality_dropout_prob: float = 0.0,
+        ablate_text: bool = False,
+        ablate_image: bool = False,
     ) -> None:
         super().__init__()
         self.text_model = AutoModel.from_pretrained(text_model_name)
@@ -55,6 +57,8 @@ class MultiModalSentimentModel(nn.Module):
         )
         self.backbone_feat_dim = resnet.fc.in_features
         self.modality_dropout_prob = modality_dropout_prob
+        self.ablate_text = bool(ablate_text)
+        self.ablate_image = bool(ablate_image)
         self.text_contrastive_proj = nn.Sequential(
             nn.Linear(text_dim, image_embed_dim),
             nn.LayerNorm(image_embed_dim),
@@ -124,6 +128,13 @@ class MultiModalSentimentModel(nn.Module):
         text_feat = text_hidden[:, 0, :]
         image_features = self.image_backbone(pixel_values)
         text_hidden, text_feat, image_features = self._apply_modality_dropout(text_hidden, text_feat, image_features)
+
+        if self.ablate_text:
+            text_hidden = torch.zeros_like(text_hidden)
+            text_feat = torch.zeros_like(text_feat)
+        if self.ablate_image:
+            image_features = torch.zeros_like(image_features)
+
         pooled = self.global_pool(image_features)
         img_feat = self.image_projection(pooled)
         text_cl = self.text_contrastive_proj(text_feat)

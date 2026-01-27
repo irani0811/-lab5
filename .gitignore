@@ -1,7 +1,11 @@
 # datasets / outputs
 /data/
-/outputs/
+/outputs/*
+!/outputs/composite_figure.png
 /outputs_*/
+
+!/outputs_*/training_history.json
+!/outputs_*/val_metrics.json
 
 # model checkpoints
 *.pt

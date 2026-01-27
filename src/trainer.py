@@ -277,6 +277,9 @@ def run_train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     total_start = time.perf_counter()
     ensure_dir(Path(args.output_dir))
+
+    if bool(getattr(args, "ablate_text", False)) and bool(getattr(args, "ablate_image", False)):
+        raise ValueError("ablation setting conflict: cannot enable both --ablate-text and --ablate-image")
     tokenizer = AutoTokenizer.from_pretrained(args.text_model)
     train_transform = build_image_transform(
         args.image_size, True, args.use_image_aug, args.use_strong_image_aug
@@ -322,6 +325,8 @@ def run_train(args: argparse.Namespace) -> None:
         text_train_layers=args.text_train_layers,
         cross_attn_heads=args.cross_attn_heads,
         modality_dropout_prob=args.modality_dropout_prob,
+        ablate_text=bool(getattr(args, "ablate_text", False)),
+        ablate_image=bool(getattr(args, "ablate_image", False)),
     ).to(args.device)
 
     optimizer = torch.optim.AdamW(
@@ -488,6 +493,8 @@ def run_train(args: argparse.Namespace) -> None:
                     "modality_dropout_prob": args.modality_dropout_prob,
                     "use_caption": bool(getattr(args, "use_caption", False)),
                     "caption_file": str(getattr(args, "caption_file", "captions.json")),
+                    "ablate_text": bool(getattr(args, "ablate_text", False)),
+                    "ablate_image": bool(getattr(args, "ablate_image", False)),
                 },
             )
             save_predictions(guids, preds, Path(args.output_dir) / "val_predictions.csv")
@@ -519,6 +526,8 @@ def run_train(args: argparse.Namespace) -> None:
                         "modality_dropout_prob": args.modality_dropout_prob,
                         "use_caption": bool(getattr(args, "use_caption", False)),
                         "caption_file": str(getattr(args, "caption_file", "captions.json")),
+                        "ablate_text": bool(getattr(args, "ablate_text", False)),
+                        "ablate_image": bool(getattr(args, "ablate_image", False)),
                     },
                 )
                 ema.restore(model)
@@ -575,6 +584,10 @@ def run_predict(args: argparse.Namespace) -> None:
     )
 
     preds, _, guids, _ = _evaluate(model, dataloader, args.device)
+    set_seed(args.seed)
     ensure_dir(Path(args.output_dir))
+
+    if bool(getattr(args, "ablate_text", False)) and bool(getattr(args, "ablate_image", False)):
+        raise ValueError("ablation setting conflict: cannot enable both --ablate-text and --ablate-image")
     save_predictions(guids, preds, Path(args.output_dir) / "test_predictions.csv")
     print(f"测试集预测已输出到 {Path(args.output_dir) / 'test_predictions.csv'}")

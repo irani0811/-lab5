@@ -90,6 +90,16 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="训练阶段以该概率随机屏蔽单一模态特征，提升鲁棒性",
     )
+    parser.add_argument(
+        "--ablate-text",
+        action="store_true",
+        help="消融：训练/验证时屏蔽文本模态，仅使用图像模态（image-only）",
+    )
+    parser.add_argument(
+        "--ablate-image",
+        action="store_true",
+        help="消融：训练/验证时屏蔽图像模态，仅使用文本模态（text-only）",
+    )
     parser.add_argument("--balance-sampler", action="store_true", help="训练 DataLoader 使用类别均衡采样")
     parser.add_argument(
         "--grad-accum-steps",

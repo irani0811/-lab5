@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -24,11 +25,6 @@ def _safe_read_json(path: Path) -> Optional[object]:
 def _discover_runs(project_root: Path) -> List[Path]:
     candidates: List[Path] = []
 
-    # outputs (no suffix)
-    p = project_root / "outputs"
-    if p.is_dir():
-        candidates.append(p)
-
     # outputs_* folders
     for item in sorted(project_root.glob("outputs_*")):
         if item.is_dir():
@@ -37,6 +33,45 @@ def _discover_runs(project_root: Path) -> List[Path]:
     # filter runs with metrics
     runs = [p for p in candidates if (p / "val_metrics.json").exists() and (p / "training_history.json").exists()]
     return runs
+
+
+def _maybe_add_outputs_dir(project_root: Path, candidates: List[Path]) -> None:
+    p = project_root / "outputs"
+    if p.is_dir():
+        candidates.append(p)
+
+
+def _fingerprint_run_dir(run_dir: Path) -> Optional[str]:
+    metrics_path = run_dir / "val_metrics.json"
+    history_path = run_dir / "training_history.json"
+    if not metrics_path.exists() or not history_path.exists():
+        return None
+
+    try:
+        metrics_bytes = metrics_path.read_bytes()
+        history_bytes = history_path.read_bytes()
+        h = hashlib.sha256()
+        h.update(metrics_bytes)
+        h.update(b"\n---\n")
+        h.update(history_bytes)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _dedup_run_dirs(run_dirs: List[Path]) -> List[Path]:
+    seen: set[str] = set()
+    out: List[Path] = []
+    for d in run_dirs:
+        fp = _fingerprint_run_dir(d)
+        if fp is None:
+            out.append(d)
+            continue
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append(d)
+    return out
 
 
 def _count_parameters_from_checkpoint(checkpoint_path: Path) -> Optional[int]:
@@ -148,6 +183,16 @@ def main() -> None:
         help="Project root containing outputs_* folders.",
     )
     parser.add_argument(
+        "--include-outputs",
+        action="store_true",
+        help="Include the legacy 'outputs/' directory in auto-discovery.",
+    )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Disable deduplication (by hashing val_metrics.json + training_history.json).",
+    )
+    parser.add_argument(
         "--out",
         default="outputs/composite_figure.png",
         help="Output image path (relative to project root if not absolute).",
@@ -172,7 +217,17 @@ def main() -> None:
         run_dirs = [d if d.is_absolute() else (project_root / d) for d in run_dirs]
         run_dirs = [d for d in run_dirs if d.is_dir()]
     else:
-        run_dirs = _discover_runs(project_root)
+        candidates: List[Path] = []
+        for item in sorted(project_root.glob("outputs_*")):
+            if item.is_dir():
+                candidates.append(item)
+        if args.include_outputs:
+            _maybe_add_outputs_dir(project_root, candidates)
+
+        run_dirs = [p for p in candidates if (p / "val_metrics.json").exists() and (p / "training_history.json").exists()]
+
+    if not args.no_dedup:
+        run_dirs = _dedup_run_dirs(run_dirs)
 
     if not run_dirs:
         raise SystemExit("No valid runs found. Need val_metrics.json and training_history.json in outputs folders.")
