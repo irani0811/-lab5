@@ -122,6 +122,7 @@ class MultiModalSentimentModel(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values: torch.Tensor,
         return_features: bool = False,
+        return_gates: bool = False,
     ):
         text_outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
         text_hidden = text_outputs.last_hidden_state
@@ -139,10 +140,12 @@ class MultiModalSentimentModel(nn.Module):
         img_feat = self.image_projection(pooled)
         text_cl = self.text_contrastive_proj(text_feat)
         image_cl = self.image_contrastive_proj(img_feat)
+        gate_mean = None
         if self.fusion_method == "gmu":
             t = self.text_fuse(text_feat)
             v = self.image_fuse(img_feat)
             gate = self.gate_layer(torch.cat([t, v], dim=1))
+            gate_mean = gate.mean(dim=1)
             fused = gate * t + (1 - gate) * v
         elif self.fusion_method == "cross_attn":
             img_tokens = image_features.flatten(2).transpose(1, 2)
@@ -164,8 +167,12 @@ class MultiModalSentimentModel(nn.Module):
         else:
             fused = self.concat_norm(torch.cat([text_feat, img_feat], dim=1))
         logits = self.classifier(fused)
+        if return_features and return_gates:
+            return logits, text_cl, image_cl, gate_mean
         if return_features:
             return logits, text_cl, image_cl
+        if return_gates:
+            return logits, gate_mean
         return logits
 
     def _set_text_trainable_layers(self, num_layers: int) -> None:

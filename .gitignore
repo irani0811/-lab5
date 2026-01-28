@@ -7,6 +7,20 @@
 !/outputs_*/training_history.json
 !/outputs_*/val_metrics.json
 
+!/outputs_*/figures/
+!/outputs_*/figures/*.png
+
+!/outputs_*/val_gates.csv
+!/outputs_*/test_gates.csv
+
+!/outputs_*/gate_figures/
+!/outputs_*/gate_figures/*.png
+!/outputs_*/gate_figures/*.json
+
+!/outputs_352_summary/
+!/outputs_352_summary/*.csv
+!/outputs_352_summary/*.md
+
 # model checkpoints
 *.pt
 *.pth

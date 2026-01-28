@@ -1,8 +1,7 @@
 # 实验五：多模态情感分类
 
-GitHub 仓库：<https://github.com/irani0811/-lab5>
-
-本项目实现 PPT 要求的文本 + 图像情感识别流程。核心思想：
+本项目实现文本 + 图像情感识别流程。
+核心思想：
 
 - 文本模态：复用 HuggingFace 预训练 Transformer（默认 `roberta-base`）。
 - 图像模态：使用 ImageNet 预训练的 `ResNet18/ResNet50`，并通过线性层投影到统一嵌入维度。

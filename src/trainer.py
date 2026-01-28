@@ -113,21 +113,43 @@ def _evaluate(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-) -> Tuple[List[int], Optional[List[int]], List[str], Dict[str, float]]:
+) -> Tuple[List[int], Optional[List[int]], List[str], Dict[str, float], Optional[List[float]]]:
     model.eval()
     preds: List[int] = []
     labels: List[int] = []
     guids: List[str] = []
-    for batch in dataloader:
-        guid_batch = batch.get("guid")
-        batch = move_batch(batch, device)
-        logits = model(batch["input_ids"], batch["attention_mask"], batch["pixel_values"])
-        pred = logits.argmax(dim=1)
-        preds.extend(pred.cpu().tolist())
-        if "labels" in batch:
-            labels.extend(batch["labels"].cpu().tolist())
-        if guid_batch is not None:
-            guids.extend(list(guid_batch))
+    gates: Optional[List[float]] = [] if bool(getattr(model, "fusion_method", None) == "gmu") else None
+    with torch.no_grad():
+        for batch in dataloader:
+            guid_batch = batch.get("guid")
+            batch = move_batch(batch, device)
+            if gates is not None:
+                outputs = model(
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    batch["pixel_values"],
+                    return_gates=True,
+                )
+                if isinstance(outputs, tuple):
+                    logits, gate_mean = outputs
+                else:
+                    logits = outputs
+                    gate_mean = None
+            else:
+                logits = model(batch["input_ids"], batch["attention_mask"], batch["pixel_values"])
+                gate_mean = None
+
+            pred = logits.argmax(dim=1)
+            preds.extend(pred.cpu().tolist())
+            if "labels" in batch:
+                labels.extend(batch["labels"].cpu().tolist())
+            if guid_batch is not None:
+                guids.extend(list(guid_batch))
+            if gates is not None:
+                if gate_mean is None:
+                    gates.extend([float("nan")] * int(pred.size(0)))
+                else:
+                    gates.extend(gate_mean.detach().cpu().tolist())
 
     metrics: Dict[str, float] = {}
     if labels:
@@ -135,7 +157,7 @@ def _evaluate(
         labels_tensor = torch.tensor(labels)
         metrics["accuracy"] = float((preds_tensor == labels_tensor).float().mean().item())
         metrics["macro_f1"] = float(f1_score(labels, preds, average="macro"))
-    return preds, labels or None, guids, metrics
+    return preds, labels or None, guids, metrics, gates
 
 
 def _compute_class_counts(records) -> torch.Tensor:
@@ -452,7 +474,7 @@ def run_train(args: argparse.Namespace) -> None:
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
-        preds, labels, guids, metrics = _evaluate(model, val_loader, args.device)
+        preds, labels, guids, metrics, gates = _evaluate(model, val_loader, args.device)
         if ema is not None:
             ema.restore(model)
         val_acc = metrics.get("accuracy", 0.0)
@@ -498,6 +520,18 @@ def run_train(args: argparse.Namespace) -> None:
                 },
             )
             save_predictions(guids, preds, Path(args.output_dir) / "val_predictions.csv")
+            if gates is not None:
+                gate_path = Path(args.output_dir) / "val_gates.csv"
+                with gate_path.open("w", encoding="utf-8") as f:
+                    f.write("guid,true_tag,pred_tag,gate_text\n")
+                    if labels is None:
+                        for guid, pred_id, gate_value in zip(guids, preds, gates):
+                            f.write(f"{guid},,{ID2LABEL[pred_id]},{gate_value:.6f}\n")
+                    else:
+                        for guid, true_id, pred_id, gate_value in zip(guids, labels, preds, gates):
+                            f.write(
+                                f"{guid},{ID2LABEL[true_id]},{ID2LABEL[pred_id]},{gate_value:.6f}\n"
+                            )
             if labels is not None:
                 metrics_report = classification_report_dict(labels, preds)
                 save_json(
@@ -583,11 +617,17 @@ def run_predict(args: argparse.Namespace) -> None:
         pin_memory=args.device.type == "cuda",
     )
 
-    preds, _, guids, _ = _evaluate(model, dataloader, args.device)
+    preds, _, guids, _, gates = _evaluate(model, dataloader, args.device)
     set_seed(args.seed)
     ensure_dir(Path(args.output_dir))
 
     if bool(getattr(args, "ablate_text", False)) and bool(getattr(args, "ablate_image", False)):
         raise ValueError("ablation setting conflict: cannot enable both --ablate-text and --ablate-image")
     save_predictions(guids, preds, Path(args.output_dir) / "test_predictions.csv")
+    if gates is not None:
+        gate_path = Path(args.output_dir) / "test_gates.csv"
+        with gate_path.open("w", encoding="utf-8") as f:
+            f.write("guid,pred_tag,gate_text\n")
+            for guid, pred_id, gate_value in zip(guids, preds, gates):
+                f.write(f"{guid},{ID2LABEL[pred_id]},{gate_value:.6f}\n")
     print(f"测试集预测已输出到 {Path(args.output_dir) / 'test_predictions.csv'}")
