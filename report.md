@@ -1,192 +1,258 @@
-
 # 实验五：多模态情感分类实验报告
-GitHub 仓库：<https://github.com/irani0811/-lab5>
-## 1. 实验任务概述
-- 目标：输入配对的文本与图像，输出情感标签（positive / neutral / negative）。
-- 数据来源：`train.txt`、`test_without_label.txt` 与 `data/` 目录下的 guid 文件。
+
+## 1. 摘要
+
+本实验研究图文配对的三分类情感分析任务，输入为同一 `guid` 对应的一段文本与一张图片，输出情感标签（`negative / neutral / positive`）。我们以 `roberta-base` 与 ImageNet 预训练 `ResNet18` 为骨干，构建了统一训练框架，并在固定的数据划分（`seed=42`、`val_ratio=0.2`）与超参数设置下，对多种后期融合策略进行对比，包括简单拼接（Concat）、门控融合（GMU）、跨注意力（Cross-Attn）与双向协同注意力（Co-Attn）。此外，我们验证了使用 BLIP 生成图像 caption 并与原始文本拼接的增强策略，并通过 text-only / image-only 消融实验量化两种模态的贡献。
+
+主要结论如下：
+
+- **融合结构对比**：Co-Attn 在融合结构对比中取得最优验证集性能（Acc=0.7550，Macro-F1=0.6337），相较 Concat baseline（Acc=0.7425，Macro-F1=0.5972）有稳定提升。
+- **Caption 增强**：在不改变融合方式（Concat）的前提下，引入 BLIP caption 可提升整体 Macro-F1（0.5972 → 0.6251），并改善 neutral 类召回率与 F1。
+- **类别瓶颈**：neutral 类仍是主要瓶颈，baseline 的 neutral Recall 为 0.2078，说明模型倾向将中性样本误判为正/负向；更强的跨模态交互（Co-Attn）与 caption 增强均能缓解该问题。
+- **正则化与预处理消融**：在 24 组对照中，弱图像增强 + R-Drop 达到最高 Macro-F1=0.6522，Neutral F1 最高 0.4463。
+- **GMU 门控分析**：`gate_text` 分布集中在 0.5 附近（均值 0.5017，std 0.0049），类别间差异很小，整体更接近等权融合。
+
+## 2. 方法
+
+### 2.1. 模型架构与动机
+
+整体框架采用“文本编码 + 图像编码 + 融合分类”的后期融合范式：
+
+- **文本侧**：采用 HuggingFace `roberta-base`（`AutoModel`）输出的 `last_hidden_state`，取首位 token（RoBERTa 等价于 CLS 位）的表示作为文本全局特征。
+- **图像侧**：采用 ImageNet 预训练 `ResNet18/ResNet50`，提取最后卷积特征图，经 `AdaptiveAvgPool2d` 池化后做线性投影得到视觉全局特征。
+
+在融合模块上，我们实现并对比了四类后期融合方式：
+
+- **Concat**：直接拼接文本特征与图像特征，经 LayerNorm 后送入两层 MLP 分类头。
+- **GMU**：分别将两模态映射到同一隐藏空间，并用门控网络产生融合权重，实现样本级的动态加权融合。
+- **Cross-Attn**：将 ResNet 特征图展平为“视觉 token”，以文本 CLS 为 query 对视觉 token 做多头注意力汇聚，再与图像全局特征拼接进行分类。
+- **Co-Attn**：同时进行“文本从视觉聚合上下文”和“视觉从文本聚合线索”的双向注意力交互，再将两路上下文与图像全局特征拼接归一化后分类。该结构更强调跨模态的双向对齐与互补，适合处理图文不一致或任一模态信息不足的样本。
+
+此外，为提高鲁棒性，模型在训练阶段支持 Modality Dropout（特征级随机屏蔽单一模态），并支持 text-only / image-only 的消融开关，用于分析两模态的相对贡献。
+
+### 2.2. 文本数据清洗
+
+Twitter 文本中普遍存在 URL、@ 用户、# 话题等噪声信息。为降低模型对无关模式的拟合，本项目提供 `--clean-text` 开关，对原始文本做轻量清洗。其实现规则为：
+
+- **URL 清理**：移除形如 `http(s)://...` 的 URL 片段。
+- **标签清理**：移除以 `@` 或 `#` 开头的标签串（如 `@user`、`#topic`）。
+- **空白规范化**：合并连续空格，并做首尾去空。
+
+同时，若 `data/{guid}.txt` 为空文本，读取逻辑会将其回退为 `"[PAD]"`，以避免空输入导致的异常，并保证训练过程稳定。
+
+### 2.3. 图像数据增强
+
+图像侧默认做统一的尺度与归一化处理：
+
+- **Resize**：统一缩放到 `224×224`。
+- **Normalize**：采用 ImageNet 均值/方差进行归一化。
+
+训练阶段可通过参数启用增强策略：
+
+- **基础增强（`--use-image-aug`）**：`RandomResizedCrop(scale=0.7~1.0)` + `RandomHorizontalFlip`，并额外加入 `ColorJitter` 与 `GaussianBlur` 的随机扰动。
+- **强化增强（`--use-strong-image-aug`）**：在基础增强上叠加 `RandAugment(num_ops=2, magnitude=9)`，用于提升在小数据集上的泛化能力。
+
+### 2.4. 损失函数与优化策略
+
+本项目训练默认采用 AdamW 优化器与 Warmup+Cosine 学习率调度，核心配置为：学习率 `2e-5`，权重衰减 `0.01`，训练轮数 `6`。同时，训练脚本提供多种可选的损失与正则化策略，便于后续扩展：
+
+- **损失函数**：交叉熵（`ce`）/ 类别重加权交叉熵（`weighted_ce`）/ Focal Loss（`focal`）。
+- **Label Smoothing**：通过 `--label-smoothing` 抑制过拟合与过度置信。
+- **R-Drop**：通过 `--rdrop-alpha` 在双前向输出之间加入对称 KL 约束，提升分布一致性。
+- **梯度累积与裁剪**：支持 `--grad-accum-steps` 与 `--max-grad-norm`，用于显存受限场景。
 
 
-## 2. 数据集与预处理
-- `train.txt`：约 5k 样本，包含 guid 与标签。
-- `data/`：每个 guid 对应一条英文短文本与一张图片。
-- 注意：`data/` 目录内存在少量冗余文件，训练与评估时以 `train.txt` / `test_without_label.txt` 中提供的 guid（以及训练标签）为准。
-- 预处理策略：
-  - 文本：使用 HuggingFace `roberta-base` tokenizer（RoBERTa[2]），最长 128 token，空文本回退到 `[PAD]`；支持仅微调最后 N 层。
-  - 图像：统一 Resize 到 224×224，并按 ImageNet 均值/方差归一化；训练可启用 RandAug 风格增强（RandomResizedCrop、ColorJitter、GaussianBlur）。
-  - 训练阶段按照要求，从训练集划分 20% 作为验证集（`--val-ratio` 可调），并可选对 neutral 类过采样及类别均衡采样。
 
-## 3. 模型与训练流程
+### 2.5. Modality Dropout
 
-本项目的训练流程围绕“**文本编码 + 图像编码 + 融合分类**”展开。文本侧采用 `roberta-base`（RoBERTa[2]）提取句级语义表示，并支持通过 `--text-train-layers` **仅微调最后 N 层**以提高稳定性并降低过拟合风险。图像侧使用 ImageNet 预训练的 `ResNet18/ResNet50`（ResNet[3]）提取视觉特征，再通过线性层映射到统一的嵌入维度（默认 256），从而与文本表示在同一特征空间内交互。为提升鲁棒性，我加入了**模态 Dropout**，在训练时随机屏蔽单一模态，使模型学会在图像或文本缺失/噪声时仍保持可用的判别能力。
+为缓解多模态学习中“过度依赖单一强模态”的问题，我们在训练阶段引入样本级的模态丢弃（`--modality-dropout-prob`）。其具体做法是：对同一 batch 内的样本，分别以给定概率随机置零文本特征或图像特征，并显式避免同时丢弃两种模态。该策略能够迫使模型学习到更稳健的跨模态判别机制，从而在推理阶段更好地处理模态冲突与噪声输入。
 
-在融合模块上，我分别实现了**简单拼接**、**门控融合（GMU[1]）**、**跨注意力**与**双向协同注意力**。其中 **co_attn** 允许文本与图像互相检索关键线索后再进行融合，旨在缓解图文不一致或信息不足造成的误判。优化方面统一使用 **AdamW[6]（lr=2e-5）**，并结合**梯度累积**（`--grad-accum-steps`）、**Warmup+Cosine** 调度、**AMP**、**EMA**、**标签平滑**、**R-Drop[5]** 等策略，保证训练稳定并提升泛化。
+## 3. 实验与分析
 
-整体流程如图所示：
+### 3.1. 实验设置
 
-```mermaid
-flowchart LR
-  A["读取 train.txt 与 data"] --> B["构建样本 guid-text-image-label"]
-  B --> C["划分 Train-Val val_ratio seed"]
-  C --> D["文本预处理 clean + tokenizer"]
-  C --> E["图像预处理 resize normalize"]
-  H{"可选 BLIP caption 拼接"}
-  H -->|是| D
-  D --> F["文本编码器 RoBERTa 输出 CLS"]
-  E --> G["图像编码器 ResNet + projection"]
-  F --> I["融合 concat GMU cross-attn co_attn"]
-  G --> I
-  I --> J["分类头输出 logits"]
-```
+本实验使用提供的图文配对数据集，训练集共 4000 条样本，类别分布为：positive 2388、negative 1193、neutral 419。按照 `val_ratio=0.2` 从训练集中划分验证集（固定 `seed=42`），得到验证集 800 条样本，类别分布为：positive 478、negative 245、neutral 77。测试集 `test_without_label.txt` 共 511 条样本，仅提供 `guid` 用于最终推理与提交。
 
-```mermaid
-flowchart LR
-  J["logits"] --> K["训练 AdamW + scheduler + AMP EMA optional"]
-  K --> L["验证评估 Acc Macro-F1 per-class PRF"]
-  L --> M["保存 best_model.pt val_metrics.json training_history.json"]
-  M --> N["可视化 visualize.py"]
-  M --> O["综合对比图 make_composite_figure.py"]
-```
+本实验的统一超参数设置如表1 所示。除对比变量外，各实验尽量保持一致，以确保结论具备可比性。
 
-## 4. 结果与可视化
+表1. 关键实验设置与超参数
 
-### 4.0 对比实验设置思路（变量控制与评价口径）
-
-本实验的核心目标是验证“更强的融合模块”与“用生成式 caption 显式注入图像语义”是否能提升多模态情感分类效果。为了保证对比结论可信，实验设计遵循以下原则：
-
-1. **控制变量**
-   - 在每组对比中仅改变一个因素（例如只改 `fusion_method`，或只开/关 `use_caption`），其余训练超参保持一致。
-   - 统一数据划分：固定 `seed=42`、`val_ratio=0.2`，确保验证集一致，避免由于随机划分造成的波动掩盖真实增益。
-
-2. **两条对比主线**
-   - **融合策略对比**：在同一 backbone（文本 `roberta-base` + 图像 `resnet18`）和同一训练配置下，对比 `concat / gmu / cross_attn / co_attn` 的效果差异。
-   - **BLIP Caption 增强对比**：在相同 fusion下，仅额外拼接 `[文本] [SEP] [caption]`，检验 caption 是否能改善困难类（尤其 neutral）的可分性。
-
-3. **统一训练配置（保证可复现）**
-   - 优化器与学习率：AdamW，lr=2e-5；训练轮数默认 6 epoch（各实验一致）。
-   - 输出产物：每次训练均保存 `training_history.json`（逐 epoch 曲线）与 `val_metrics.json`（最佳模型的分类报告），并可用 `visualize.py` 生成曲线/混淆矩阵。
-
-4. **评价指标与“best”的口径**
-   - 报告同时关注 **Val Acc** 与 **Macro-F1**：Acc 反映总体正确率，Macro-F1 更适合类别不均衡场景（neutral 为困难类）。
-   - 训练脚本默认按 **Val Acc** 选择并保存 `best_model.pt`，因此 `val_metrics.json` 对应的是“按 Acc 最优 epoch”的指标；而收敛曲线来自 `training_history.json` 的逐 epoch 记录，二者口径不同属于正常现象。
-
-### 4.1 融合策略对比（固定 seed=42, val_ratio=0.2）
-
-本节在完全相同训练设置下，仅切换 `fusion_method`，对比不同融合结构对验证集表现的影响，作为后续分析的主对照结论。
-
-| 配置（fusion_method） | Best Val Acc | Best Val Macro-F1 | Best Epoch |
-|---|---:|---:|---:|
-| Concat（baseline） | 0.7425 | 0.5972 | 3 |
-| GMU | 0.7325 | 0.6049 | 3 |
-| Cross-Attn | 0.6563 | 0.4926 | 2 |
-| Co-Attn | **0.7550** | **0.6337** | 4 |
-
-从表中可以看到，在保持训练设置一致（同一随机种子与验证划分比例）的前提下，**不同融合策略对最终性能影响显著**。其中，`co_attn` 在验证集**准确率**与 **Macro-F1** 上均达到本组实验的最高值，说明在图文信息需要互相“对齐”与“互补”的场景中，**双向协同注意力**能够更充分地挖掘跨模态关联，从而带来更稳定的增益。相比之下，`cross_attn` 的准确率与 Macro-F1 均明显偏低，反映出该结构在当前数据规模与训练轮数下**更难收敛**，存在训练不稳定或欠拟合的现象。
-
-### 4.2 BLIP Caption 拼接增强对比（Concat baseline vs BLIP Caption）
-
-本节保持融合方式为 `concat` 不变，仅引入 caption 拼接来检验“生成式语义注入”是否能在不改结构的情况下带来增益。
-
-| 配置 | Best Val Acc | Best Val Macro-F1 | Best Epoch |
-|---|---:|---:|---:|
-| Baseline（不加 caption） | 0.7425 | 0.5972 | 3 |
-| BLIP Caption（[文本] [SEP] [caption]） | **0.7463** | **0.6251** | 3 |
-
-上表给出的结果表明，在融合方式固定为 `concat` 的情况下，**仅通过引入 BLIP 生成的图像 caption** 并与原文本进行拼接，就能带来一致的性能提升。尤其是 **Macro-F1** 的提升幅度更明显（约 **+0.028**），而准确率仅小幅增加（约 +0.004）。这意味着 caption 的收益并非来自对多数类样本的进一步“刷分”，而更可能来自对**难样本/少数类**的区分能力增强。换言之，caption 将图像中隐含的语义**显式转写为文本线索**，使文本编码器能更容易捕捉到与情感倾向相关的细粒度描述，从而改善整体的宏平均指标。
-
-### 4.3 类别级别分析（Neutral 改进最明显）
-
-本节从类别层面展开，重点观察 neutral 这一困难类的 Precision/Recall/F1 变化，用于解释宏平均指标的提升来源。
-
-| 配置 | Neutral Precision | Neutral Recall | Neutral F1 |
-|---|---:|---:|---:|
-| Baseline | 0.4571 | 0.2078 | 0.2857 |
-| BLIP Caption | 0.4528 | 0.3117 | 0.3692 |
-| Co-Attn | 0.4127 | 0.3377 | 0.3714 |
-
-上表进一步从类别角度解释了为什么 **Macro-F1** 会对方法改进更敏感。可以观察到，Baseline 在 **neutral** 类别上的**召回率**仅为 **0.2078**，说明模型在不确定样本上更倾向于将其归入 positive/negative，从而导致 neutral 被大量漏检。
-
-引入 **BLIP caption** 后，neutral 的召回率提升到 **0.3117**，F1 也同步上升；而 `co_attn` 在 neutral 的召回率上进一步达到 **0.3377**。
-
-综合来看，**caption 增强**与更强的**跨模态交互结构**都能在一定程度上缓解“neutral 难识别”的问题。其背后的直观解释是，neutral 往往缺少明显的情感词或强烈视觉线索，需要模型综合语境与图像细节判断“情感不显著”，因此当图像语义被**显式注入**或跨模态对齐更充分时，neutral 的区分难度会降低。
-
-
-### 4.4 可视化产物（用于报告插图）
-
-为了更直观地展示训练过程与**错误模式**，本项目为每个实验输出目录提供了自动可视化产物。
-
-![composite_figure](outputs/composite_figure.png)
-
-- (a) 的雷达图可以直观看到，各方法在 **Acc / Macro-F1 / Neutral-F1** 上呈现出不同的权衡关系，同时**训练时间**与**参数量**也对实际可用性产生影响。我在绘制时对五个维度进行了归一化，其中训练时间与参数量采用“**越小越好**”的反向归一化，因此面积越大代表综合表现越优。
-- 图(b) 进一步给出了参数量与训练时间的量化对照：可以观察到**更复杂的融合结构通常伴随更高的训练成本**。
-- 图(c) 则从收敛过程角度验证了性能差异并非偶然波动：多数方法在第 **3–5** 个 epoch 左右达到 **Macro-F1** 的相对峰值，随后趋于稳定或略有回落。综合这三幅子图，我可以在“**效果—效率**”两方面对模型做出更全面的取舍。
-
-### 4.5 选择最佳 epoch 与最终最佳配置（基于验证集 Macro-F1）
-
-说明：项目在训练时默认按 **验证准确率（Val Acc）** 保存 `best_model.pt`，因此 `val_metrics.json` 中记录的是“按 **Acc 最优 epoch**”的分类报告；而综合图(c)展示的是 `training_history.json` 中每一轮的 `val_macro_f1` 曲线。因此会出现“曲线峰值的 **Macro-F1** 高于 `val_metrics.json` 里 best_macro_f1”的情况，这是由于 **best 的选择口径不同**。
-
-本报告最终的模型选择以 **Macro-F1 优先**（更适合类别不均衡，且能更好反映 neutral 类表现）为准，对每个实验从 `training_history.json` 中挑选 `val_macro_f1` 的峰值 epoch，汇总如下：
-
-| 实验 | Val Acc 最优 epoch | Val Acc@best | Macro-F1 最优 epoch | Macro-F1@best |
-|---|---:|---:|---:|---:|
-| Concat baseline (`outputs_baseline`) | 3 | 0.7425 | 4 | 0.6252 |
-| BLIP Caption (`outputs_blip`) | 3 | 0.7463 | 4 | 0.6350 |
-| GMU (`outputs_gmu`) | 3 | 0.7325 | 4 | 0.6072 |
-| Cross-Attn (`outputs_cross_attn`) | 2 | 0.6563 | 5 | 0.5402 |
-| Co-Attn (`outputs_co_attn`) | 4 | 0.7550 | 4 | 0.6337 |
-
-在上述对照中可以看到，不同方法的“Acc 最优 epoch”与“**Macro-F1 最优 epoch**”并不总是一致，尤其是在 **neutral 类较难**的情况下，Macro-F1 的峰值往往出现在准确率略低但类别更均衡的轮次。结合收敛曲线可以发现，多数方法在第 **4** 个 epoch 左右已达到 Macro-F1 的相对峰值，后续继续训练带来的收益很有限，甚至会出现轻微回落，这与**过拟合**或类别边界被进一步“压向多数类”的现象一致。因此，在当前设置（**6 epochs**，**seed=42**，**val_ratio=0.2**）下，我认为没有必要为了形式上的“跑更久”而增加训练轮数，更合理的策略是采用**早停思想**，直接选择峰值附近的 checkpoint。
-
-综合准确率、**Macro-F1** 以及 **neutral 类**的改善情况，最终我将 `co_attn` 作为本次实验的**最优融合方案**。该方法不仅在验证集准确率上达到最高值，同时在 Macro-F1 上也保持在第一梯队，并且 neutral 的 **Recall/F1** 改善更为稳定。考虑到其峰值出现在 **epoch=4**，最终模型可直接使用训练脚本保存的 `outputs_co_attn/best_model.pt` 进行推理与提交。
-
-### 4.6 消融实验（Text-only / Image-only）
-
-根据要求，除多模态融合模型整体效果外，还需要验证**单一模态的贡献**，即分别只输入文本或只输入图像时模型在验证集上的表现。为此，我在训练脚本中加入了**消融开关**：当启用 `--ablate-image` 时**屏蔽图像模态（text-only）**，启用 `--ablate-text` 时**屏蔽文本模态（image-only）**。在对比实验设置上，我保持与主实验一致的**随机种子**与**验证划分比例**，并尽量使用相同训练超参，以保证消融结论能够反映“模态信息量”差异，而非其他因素的干扰。
-消融结果建议以如下表格呈现：
-
-| 设置 | Best Val Acc | Best Val Macro-F1 | Neutral F1 |
-|---|---:|---:|---:|
-| Text-only（仅文本） | 0.7275 | 0.5548 | 0.2245 |
-| Image-only（仅图像） | 0.6700 | 0.4721 | 0.1935 |
-| Multimodal（图像+文本，最佳配置） | 0.7550 | 0.6337 | 0.3714 |
-
-从本次消融结果可以更清晰地看出两种模态各自的**贡献**与**局限**：
-- 在**单模态条件**下，text-only 的整体表现明显优于 image-only（Acc 0.7275 vs 0.6700，Macro-F1 0.5548 vs 0.4721），说明在该数据集中，文本中显式的情感线索仍然是最稳定的判别依据；而仅依赖图像时，模型更容易退化为对“强情感画面”的粗粒度识别，从而在宏平均指标上吃亏。与此同时，两种单模态在 neutral 类上都表现偏弱，Neutral F1 分别只有 0.2245 与 0.1935，这也验证了 neutral 的困难更多来自“缺少显著线索”而非某一种模态的信息不足。
-
-- 当**同时使用图像与文本**后，多模态模型在整体指标与 neutral 类上均有显著提升：Macro-F1 提升到 0.6337，相比 text-only 提高约 +0.079、相比 image-only 提高约 +0.162；Neutral F1 提升到 0.3714，相比 text-only 提高约 +0.147、相比 image-only 提高约 +0.178。这一差距表明融合模块确实利用到了互补信息，尤其是在需要“综合语境 + 视觉细节”才能做出更谨慎判断的 neutral 样本上，多模态学习能够有效降低单一模态的偏置与不确定性。整体而言，该消融实验为前文的融合方法对比提供了必要的因果支撑：性能提升并非仅由训练波动或参数量带来，而是来源于图文信息的协同。
-
-## 5. 遇到的问题与解决
-本项目在迭代过程中逐步从“单一基线训练”转向“**多配置并行对比**”的实验体系（融合方法对比、**BLIP caption 增强**、综合可视化与全量结果汇总、以及 **text-only / image-only 消融**）。随着实验规模扩大，我遇到的问题也从单纯的训练调参，转向了如何保证**对比公平**、如何避免**口径不一致**、以及如何快速诊断问题来源。
-
-1. **实验结果管理与可复现性**：不同融合方式与是否启用 caption 会产出大量 `outputs_*` 目录，手工整理指标不仅耗时，也容易混入重复实验或历史设置。为此我将每次运行的关键产物统一为 `val_metrics.json` 与 `training_history.json`，并使用汇总脚本对所有输出目录做自动扫描与对齐统计，再配套输出训练曲线、类别柱状图与混淆矩阵等可视化，从而把“跑完才能整理”的过程压缩成“跑完即可复盘”的固定流程。
-
-2. **最佳模型选择口径不一致**：训练代码默认按验证集 Acc 保存 `best_model.pt`，但在类别不均衡场景下我更关注 Macro-F1（尤其能更敏感地反映 neutral 类的均衡表现）。因此会出现 `training_history.json` 中某个 epoch 的 Macro-F1 峰值高于 `val_metrics.json`（按 Acc 最优 checkpoint）的现象。为避免结论被口径误导，我在报告中明确区分“按 Acc 最优”与“按 Macro-F1 最优”两种选择方式，并基于 `training_history.json` 额外统计各实验的 Macro-F1 峰值 epoch，保证跨实验对比时指标口径一致。
-
-3. **Neutral 类识别困难与类别不均衡**：从全量对比表与消融结果可以看到，neutral 类依然是整体 Macro-F1 的主要短板，且单模态条件下更容易出现对 neutral 的漏检。针对这一问题，我在训练侧引入模态 Dropout、标签平滑、R-Drop、EMA 以及可选的重加权/采样策略来提升泛化与稳定性；在分析侧则通过混淆矩阵与类别级别指标持续定位 neutral 的误判流向，把“指标差”具体落实到“错在哪一类、错到哪一类”。
-
-为便于直观展示错误模式差异，下表将两张代表性混淆矩阵左右并排展示，分别对应 baseline 与最终最佳配置 `co_attn`：
-
-| Baseline | Co-Attn（Best） |
+| 模块 | 设置 |
 |---|---|
-| ![baseline_confusion_matrix](outputs_baseline/figures/confusion_matrix.png) | ![co_attn_confusion_matrix](outputs_co_attn/figures/confusion_matrix.png) |
+| 数据划分 | `val_ratio=0.2`，`seed=42` |
+| 编码器 | Text: `roberta-base`；Image: `ResNet18`（ImageNet 预训练） |
+| 输入 | `max_len=128`；image=224×224 |
+| 优化与训练 | AdamW（lr=2×10^-5, wd=0.01），epochs=6，batch=16 |
+| 学习率调度 | Warmup+Cosine（`warmup_ratio=0.1`） |
+| 正则化与融合 | dropout=0.2；modality_dropout=0.1；fusion_hidden=512；image_proj=256；attn_heads=4 |
 
-4. **训练效率与实验吞吐**：注意力类融合结构会显著增加每轮耗时，使得“多配置对比”很容易被算力瓶颈卡住。我的处理方式是在同一训练框架下提供 AMP、梯度累积、冻结层与早停等开关，并把每轮耗时写入 `training_history.json`，使得最终结论不仅比较效果，也能量化比较成本，从而更符合工程落地的评估方式。
+评价指标以验证集 Accuracy 与 Macro-F1 为主，同时给出类别级 Precision/Recall/F1。训练脚本默认以验证集 Accuracy 保存 `best_model.pt`，因此 `val_metrics.json` 对应的是“按 Acc 最优”的分类报告；而逐 epoch 的收敛情况记录在 `training_history.json` 中。
 
-## 6. 创新点/亮点
-1. **多模态融合模块可插拔（统一训练入口）**：我将模型封装为 `MultiModalSentimentModel`，在同一训练脚本 `train_multimodal.py` 下支持 `concat / gmu / cross_attn / co_attn` 等多种融合方式（GMU[1]），并保持文本编码（`roberta-base`，RoBERTa[2]）与图像编码（`ResNet18/50`，ResNet[3]）的接口一致。
+### 3.2. 不同模型架构性能对比
 
-这一点看起来像“工程封装”，但实际难点在于要把不同融合结构的**输入输出维度**、**mask 处理**、以及训练/推理路径统一起来，否则对比实验会不断被实现细节打断。通过把变化点严格限制在 **`fusion_method`**，我才能在固定 seed 与划分的前提下做结构对照，并将差异解释为“**融合机制带来的增益**”，而不是“代码路径不一致带来的偶然波动”。
+#### 3.2.1. 融合结构对比
 
-2. **BLIP Caption 拼接增强（生成式辅助特征）**：我引入 BLIP[4] 生成图像 caption，并将其与原文本按 `[文本] [SEP] [caption]` 拼接输入文本编码器。
+在保持骨干网络与训练设置一致的前提下，我们仅切换 `fusion_method`，对比 Concat / GMU / Cross-Attn / Co-Attn 四种后期融合结构在验证集上的表现。统计结果如表2 所示，其中参数量为模型可训练参数总量（M），平均耗时为每个 epoch 的平均训练耗时（秒）。
 
-在实现层面，这条路径的关键不是“把 caption 拼上去”这么简单，而是要保证 caption 的**生成/缓存**与训练数据读取严格对齐同一个 **guid**，避免出现错配导致的噪声；同时还要在实验设计上**控制变量**，使得 caption 的收益能够被单独归因。结果部分可以看到，caption 的主要收益集中在 **Macro-F1** 与 **neutral 类**上，这也符合“caption 把图像语义**显式化**后，更利于难样本判断”的预期。
+表2. 不同融合结构验证集性能与代价对比
 
-3. **训练稳定性与效率的工程化组合**：训练侧采用 AdamW[6]，并集成标签平滑、R-Drop[5]、EMA、模态 Dropout、Warmup+Cosine 调度、梯度累积与 AMP 等策略。
+| 架构名称 | Acc最优Epoch | Acc / Macro-F1 / W-F1（按Acc最优） | Neutral F1 | 参数量(M) | 平均每轮耗时(s) |
+|---|---:|---|---:|---:|---:|
+| Concat（baseline） | 3 | 0.7425 / 0.5972 / 0.7283 | 0.2857 | 136.76 | 63.8 |
+| GMU | 3 | 0.7325 / 0.6049 / 0.7206 | 0.3448 | 137.54 | 65.5 |
+| Cross-Attn | 2 | 0.6562 / 0.4926 / 0.6228 | 0.2524 | 139.51 | 103.8 |
+| Co-Attn | 4 | **0.7550 / 0.6337 / 0.7493** | **0.3714** | 142.27 | 143.7 |
 
-我的出发点是让训练曲线**更稳定**、不同融合结构的收敛**更可控**，同时把每轮耗时与验证指标写入 `training_history.json`。这样报告不仅回答“哪个方法更好”，也能解释“**为什么更好、代价是多少**”，与前文的综合对比图形成闭环。
+从表2 可以看出：
+
+- **Co-Attn 效果最优但代价最高**：其 Acc 与 Macro-F1 均为最高，同时 neutral F1 达到 0.3714，但由于引入双向注意力交互，训练耗时显著增加。
+- **GMU 在 neutral 上更均衡**：相较 Concat，GMU 的 neutral F1 有提升（0.2857 → 0.3448），但整体 Acc 略有下降，体现了“均衡性提升”与“总体正确率”之间的权衡。
+- **Cross-Attn 收敛与稳定性较弱**：该结构在本设置下出现明显性能退化，且训练成本较高，说明仅靠单向跨注意力并不一定能带来收益。
+
+为便于从“效果—效率”角度综合观察不同方法的取舍，我们进一步给出多维对比可视化（雷达图、参数量与训练时间、Macro-F1 收敛曲线）如下。
+
+![composite_figure](project5/outputs/composite_figure.png)
+
+图1. 多方法综合对比可视化（归一化雷达图、参数量与训练时间、Macro-F1 收敛曲线）
+
+#### 3.2.2. BLIP Caption 增强对比
+
+本节保持融合方式为 Concat 不变，仅引入 BLIP 生成的图像 caption，并将输入文本拼接为 `[原始文本] [SEP] [caption]`，以检验“生成式语义注入”对验证集性能的影响。对比结果如表3。
+
+表3. Caption 增强对比（Concat baseline vs BLIP+Concat）
+
+| 配置 | Acc最优Epoch | Acc / Macro-F1 / W-F1（按Acc最优） | Neutral P / R / F1 | 平均每轮耗时(s) |
+|---|---:|---|---|---:|
+| Baseline（不加 caption） | 3 | 0.7425 / 0.5972 / 0.7283 | 0.4571 / 0.2078 / 0.2857 | 63.8 |
+| BLIP Caption（拼接 caption） | 3 | 0.7462 / 0.6251 / 0.7389 | 0.4528 / 0.3117 / 0.3692 | 83.7 |
+
+可以观察到，引入 caption 后 Macro-F1 提升更明显（+0.028），且 neutral Recall 从 0.2078 提升到 0.3117。与此同时，由于文本序列变长与输入信息增加，训练耗时也相应上升。整体上，caption 将图像语义显式转写为文本线索，有助于提升模型对困难样本的判别能力。
+
+#### 3.2.3. 训练过程分析
+
+为进一步观察模型的收敛速度与训练成本，我们对 Concat baseline 与 Co-Attn 的训练过程可视化结果进行对比，如图2 所示。
+
+| Concat（baseline） | Co-Attn |
+|---|---|
+| ![baseline_training](project5/outputs_baseline/figures/training_curves.png) | ![coattn_training](project5/outputs_co_attn/figures/training_curves.png) |
+
+图2. Baseline 与 Co-Attn 的训练曲线与每轮耗时对比
+
+从图2 可以看出：
+
+- **收敛趋势**：两种方法在前 2~3 个 epoch 内 Macro-F1 上升较快，随后趋于平稳。
+- **训练成本**：Co-Attn 的每轮耗时显著高于 baseline（表2 中约 143.7s vs 63.8s），主要源于引入双向注意力交互计算。
+
+### 3.3. 混淆矩阵分析
+
+为了定位性能差异的来源，我们进一步对比不同方法在验证集上的混淆矩阵与类别级 Precision/Recall/F1（图3、图4）。
+
+| Baseline（Concat） | Co-Attn | BLIP+Concat |
+|---|---|---|
+| ![baseline_cm](project5/outputs_baseline/figures/confusion_matrix.png) | ![coattn_cm](project5/outputs_co_attn/figures/confusion_matrix.png) | ![blip_cm](project5/outputs_blip/figures/confusion_matrix.png) |
+
+图3. 验证集混淆矩阵对比（从左到右：baseline、Co-Attn、BLIP+Concat）
+
+| Baseline（Concat） | Co-Attn | BLIP+Concat |
+|---|---|---|
+| ![baseline_cls](project5/outputs_baseline/figures/classwise_metrics.png) | ![coattn_cls](project5/outputs_co_attn/figures/classwise_metrics.png) | ![blip_cls](project5/outputs_blip/figures/classwise_metrics.png) |
+
+图4. 类别级 Precision / Recall / F1 对比（从左到右：baseline、Co-Attn、BLIP+Concat）
+
+结合图3、图4 与 `val_metrics.json`，可以得到以下结论：
+
+- **neutral 仍是主要误差来源**：baseline 中 neutral 仅 16/77 被正确识别（Recall=0.2078），其中 40/77 被误判为 positive，表明模型倾向于将“中性”样本推向情绪两端。
+- **Co-Attn 改善 neutral 识别**：Co-Attn 将 neutral 正确数提升至 26/77（Recall=0.3377，F1=0.3714），同时减少 neutral→positive 的误判（40→31）。
+- **BLIP 对 neutral 也有增益**：引入 caption 后 neutral 正确数提升至 24/77（Recall=0.3117，F1=0.3692），说明将图像语义转写为文本有助于缓解“图像信息难以直接利用”的问题。
 
 
+### 3.4. 消融实验
 
-## 参考文献
+#### 3.4.1. 模态消融
+
+为验证两种模态对最终性能的贡献，我们进行了 text-only 与 image-only 消融实验，并与 Co-Attn 的多模态结果对比，如表5。
+
+表4. 单模态消融与多模态对比
+
+| 模型 | Acc | Macro-F1 | Neutral R / F1 | 平均每轮耗时(s) |
+|---|---:|---:|---|---:|
+| Text-only | 0.7275 | 0.5548 | 0.1429 / 0.2245 | 57.3 |
+| Image-only | 0.6700 | 0.4721 | 0.1169 / 0.1935 | 33.6 |
+| Co-Attn（Text+Image） | **0.7550** | **0.6337** | **0.3377 / 0.3714** | 143.7 |
+
+进一步地，我们统计了 text-only 与 image-only 在验证集上的预测一致性，并考察多模态模型在“分歧样本”上的纠错能力：
+
+- **一致性**：两种单模态预测一致的样本占 72.6%（581/800），其中两者同时正确 462 条、同时错误 119 条。
+- **分歧纠错**：在 27.4%（219/800）的分歧样本上，多模态 Co-Attn 能将其中 64.8% 的样本纠正为正确预测（142/219）。
+- **模态贡献差异**：当 text-only 正确而 image-only 错误时（120 条），Co-Attn 有 89.2%（107/120）给出正确预测；当 image-only 正确而 text-only 错误时（74 条），Co-Attn 的纠错率为 43.2%（32/74）。该现象说明当前任务中文本仍是更强信号，但图像在部分样本上提供了有效补充。
+
+#### 3.4.2. 正则化与数据预处理消融
+
+本项目在训练侧实现了多种可选项（如 `--clean-text`、图像增强强度、label smoothing、R-Drop、Modality Dropout 概率等），这些策略通常影响“泛化稳定性”而非单一指标的极值。
+
+我们系统性地完成了该组消融（共 24 组配置），并按维度汇总最优设置与总体趋势如下：
+
+- **文本清洗（clean-text）**：对比开启/关闭 URL 与 @/# 标签清理。
+- **图像增强强度**：对比无增强 / 基础增强 / 强增强（RandAugment）。
+- **正则化项**：对比（label smoothing、R-Drop、modality dropout）不同组合的增益与训练开销。
+
+表5. 正则化与预处理消融（各维度最优设置）
+
+| 维度 | 设置 | 对应实验 | Acc | Macro-F1 | Neutral F1 |
+|---|---|---|---:|---:|---:|
+| clean-text | off | outputs_352_c0_weak_rdrop | **0.7538** | **0.6522** | 0.4414 |
+| clean-text | on | outputs_352_c1_none_md | 0.7525 | 0.6518 | 0.4463 |
+| image aug | none | outputs_352_c1_none_md | 0.7525 | 0.6518 | 0.4463 |
+| image aug | weak | outputs_352_c0_weak_rdrop | 0.7538 | 0.6522 | 0.4414 |
+| image aug | strong | outputs_352_c0_strong_ls | 0.7438 | 0.6428 | 0.4286 |
+| regularization | base | outputs_352_c0_none_base | 0.7500 | 0.6475 | 0.4317 |
+| regularization | +LS | outputs_352_c1_none_ls | 0.7513 | 0.6495 | 0.4394 |
+| regularization | +RDrop | outputs_352_c0_weak_rdrop | 0.7538 | 0.6522 | 0.4414 |
+| regularization | +MD | outputs_352_c1_none_md | 0.7525 | 0.6518 | 0.4463 |
+
+从结果可以观察到：
+
+- **clean-text**：开启/关闭的差异较小（最优 Macro-F1 0.6522 vs 0.6518），说明该数据集文本噪声并非主要瓶颈。
+- **图像增强**：弱增强整体更稳健；强增强在本任务上未带来收益，Macro-F1 反而下降，可能是 RandAugment 引入了与情感相关的细节噪声。
+- **正则化**：R-Drop 与 Modality Dropout 均带来小幅提升（Macro-F1≈0.652），且对 Neutral F1 更友好（最高 0.4463）。
+
+### 3.6. 对后期融合模型的进一步分析
+
+#### 3.6.1. 门控权重分布与模态偏好（GMU）
+
+GMU 通过门控网络为不同样本分配“更依赖文本/更依赖图像”的融合权重。我们在验证阶段导出每个样本的门控均值 `gate_text`（值越接近 1 表示越依赖文本，越接近 0 表示越依赖图像），并对 800 条验证样本进行统计分析。
+
+整体上，`gate_text` 的均值为 0.5017、标准差 0.0049（min=0.4923, max=0.5134），门控几乎集中在 0.5 附近，说明在当前训练设置下 GMU 更接近“近似等权融合”，并未呈现强烈的样本级模态切换。
+
+- **类别偏好**：negative/neutral/positive 的 `gate_text` 均值分别为 0.5047 / 0.5015 / 0.5002，差异很小，类别间未呈现明显的模态偏好分化。
+- **正确/错误对比**：正确与错误样本的 `gate_text` 均值分别为 0.5015 与 0.5022，同样差异不显著。
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="project5/outputs_gmu_gate/gate_figures/gate_hist_overall.png" style="width:320px; max-width:100%;" />
+    </td>
+    <td align="center">
+      <img src="project5/outputs_gmu_gate/gate_figures/gate_hist_correct_vs_incorrect.png" style="width:320px; max-width:100%;" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="project5/outputs_gmu_gate/gate_figures/gate_hist_by_true_class.png" style="width:520px; max-width:100%;" />
+    </td>
+  </tr>
+</table>
+
+## 4. 总结
+
+本实验围绕图文多模态情感分类任务，构建了统一的训练与评测框架，并在固定数据划分与超参设置下对多种融合策略进行了对比。实验表明：
+- **融合策略方面**：Co-Attn 在融合结构对比中表现最佳（Acc=0.7550，Macro-F1=0.6337），但训练成本明显更高；在进一步的 3.5.2 消融中，加入弱图像增强 + R-Drop 可将 Macro-F1 提升到 0.6522。
+- **类别难点方面**：neutral 是主要短板，baseline 的 neutral Recall 为 0.2078；引入更强跨模态交互或 caption 增强后，neutral 识别得到改善。
+- **模态互补方面**：text-only 整体优于 image-only，但在分歧样本上，多模态模型能较高比例纠正单模态错误，说明融合确实利用到了互补信息。
+- **可解释性方面**：GMU 的门控均值 `gate_text` 基本集中在 0.5 附近，类别间差异很小，表明该设置下 GMU 更接近等权融合。
+
+## 5. 参考文献
+
 [1] Julian Arevalo, Thamar Solorio, Manuel Montes-y-Gomez, Fabio A. González. *Gated Multimodal Units for Information Fusion*. ICLR 2017 Workshop.
 
 [2] Yinhan Liu, Myle Ott, Naman Goyal, et al. *RoBERTa: A Robustly Optimized BERT Pretraining Approach*. arXiv:1907.11692, 2019.
