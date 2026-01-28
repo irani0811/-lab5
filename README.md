@@ -89,6 +89,8 @@ python train_multimodal.py --mode train --data-dir data --train-file train.txt -
 
 在此基础上仅切换一个因素（如 `--fusion-method` 或 `--use-caption`）完成对照实验。
 
+Windows 提示：如你在 PowerShell/CMD 中运行，建议将命令写成一行，并加 `--num-workers 0`。
+
 ## 测试集推理
 
 ```bash
@@ -100,7 +102,7 @@ python train_multimodal.py \
   --output-dir outputs
 ```
 
-结果文件：`outputs/test_predictions.csv`，可直接将 `null` 替换为 `positive/neutral/negative` 后提交。
+结果文件：`outputs/test_predictions.csv`。该文件会包含每条测试样本的 `guid` 与预测标签（`negative/neutral/positive`），可直接用于提交。
 
 ## 可视化分析
 
@@ -127,6 +129,41 @@ python visualize.py \
 python train_multimodal.py --mode train --data-dir data --train-file train.txt --output-dir outputs_text_only --checkpoint-path outputs_text_only/best_model.pt --epochs 6 --seed 42 --val-ratio 0.2 --fusion-method concat --ablate-image
 python train_multimodal.py --mode train --data-dir data --train-file train.txt --output-dir outputs_image_only --checkpoint-path outputs_image_only/best_model.pt --epochs 6 --seed 42 --val-ratio 0.2 --fusion-method concat --ablate-text
 ```
+
+## 正则化/预处理消融（批量运行 + 汇总）
+
+批量运行（Windows）：
+
+```bat
+run_ablation_3_5_2.bat
+```
+
+运行结束后可汇总结果（会扫描 `outputs_352_*` 目录并生成汇总表）：
+
+```bash
+python summarize_ablation_3_5_2.py --root . --out-dir outputs_352_summary
+```
+
+产物：
+- `outputs_352_summary/ablation_3_5_2_summary.csv`
+- `outputs_352_summary/ablation_3_5_2_top10.md`
+
+## GMU 门控权重导出与可视化
+
+当 `--fusion-method gmu` 时，验证阶段会在输出目录保存：
+- `val_gates.csv`
+
+可视化门控分布：
+
+```bash
+python visualize_gates.py --gate-csv outputs_gmu_gate/val_gates.csv --out-dir outputs_gmu_gate/gate_figures
+```
+
+产物：
+- `outputs_gmu_gate/gate_figures/gate_hist_overall.png`
+- `outputs_gmu_gate/gate_figures/gate_hist_by_true_class.png`
+- `outputs_gmu_gate/gate_figures/gate_hist_correct_vs_incorrect.png`
+- `outputs_gmu_gate/gate_figures/gate_stats.json`
 
 ## 复现建议
 

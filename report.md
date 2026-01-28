@@ -1,5 +1,5 @@
 # 实验五：多模态情感分类实验报告
-
+仓库地址：https://github.com/irani0811/-lab5
 ## 1. 摘要
 
 本实验研究图文配对的三分类情感分析任务，输入为同一 `guid` 对应的一段文本与一张图片，输出情感标签（`negative / neutral / positive`）。我们以 `roberta-base` 与 ImageNet 预训练 `ResNet18` 为骨干，构建了统一训练框架，并在固定的数据划分（`seed=42`、`val_ratio=0.2`）与超参数设置下，对多种后期融合策略进行对比，包括简单拼接（Concat）、门控融合（GMU）、跨注意力（Cross-Attn）与双向协同注意力（Co-Attn）。此外，我们验证了使用 BLIP 生成图像 caption 并与原始文本拼接的增强策略，并通过 text-only / image-only 消融实验量化两种模态的贡献。
