@@ -104,6 +104,20 @@ python train_multimodal.py \
 
 结果文件：`outputs/test_predictions.csv`。该文件会包含每条测试样本的 `guid` 与预测标签（`negative/neutral/positive`），可直接用于提交。
 
+## 从零到提交：完整流程（推荐顺序）
+
+1. **训练（得到 best checkpoint）**：
+   - `python train_multimodal.py --mode train ... --output-dir outputs_xxx --checkpoint-path outputs_xxx/best_model.pt`
+2. **（可选）生成 BLIP caption 并训练 caption 版本**：
+   - 生成 caption：
+     - `python generate_blip_captions.py --data-dir data --train-file train.txt --test-file test_without_label.txt --out captions_blip.json`
+   - 训练时启用：
+     - `python train_multimodal.py --mode train ... --use-caption --caption-file captions_blip.json`
+3. **推理测试集**：
+   - `python train_multimodal.py --mode predict --test-file test_without_label.txt --checkpoint-path outputs_xxx/best_model.pt --output-dir outputs_xxx`
+4. **提交**：
+   - 提交 `outputs_xxx/test_predictions.csv`
+
 ## 可视化分析
 
 训练完成后会自动在 `outputs/` 目录下生成：
